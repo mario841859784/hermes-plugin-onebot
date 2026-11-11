@@ -1017,29 +1017,57 @@ def test_reaction_records_only_explicit_bot_mentions(monkeypatch, message, raw) 
     async def run():
         await adapter._process_message(_group_reply_event(message, raw=raw))
         assert len(captured) == 1
-        assert adapter._mentioned_messages == {}
+        assert adapter._pending_mentions == {}
         await _fire_reaction_stream_start(ctx.hooks["on_stream_start"])
 
     asyncio.run(run())
     assert "set_msg_emoji_like" not in calls
 
 
-def test_adapter_for_mention_picks_the_recording_instance() -> None:
-    """多实例时不能只拿「最近一个」adapter，否则贴不上（拿到的是不认识的表）。"""
+def test_adapter_for_chat_picks_the_instance_that_saw_the_mention() -> None:
+    """多实例时不能只拿「最近一个」adapter，否则贴不上（拿到的是没排队的实例）。"""
     import weakref
 
     from onebot_platform import adapter as adapter_mod
 
     idle = _make_adapter(reaction_on_mention=True)
     owner = _make_adapter(reaction_on_mention=True)
-    owner._mentioned_messages[77] = "group:888888"
+
+    async def seed():
+        owner._remember_mention("group:888888", "77")
+
+    asyncio.run(seed())
     adapter_mod._LIVE_ADAPTERS[:] = [weakref.ref(idle), weakref.ref(owner)]
     try:
-        assert adapter_mod._adapter_for_mention(77, "group:888888") is owner
-        assert adapter_mod._adapter_for_mention(77, "group:1") is None
-        assert adapter_mod._adapter_for_mention(78, "group:888888") is None
+        assert adapter_mod._adapter_for_chat("group:888888") is owner
+        assert adapter_mod._adapter_for_chat("group:1") is None
     finally:
         adapter_mod._LIVE_ADAPTERS[:] = []
+
+
+def test_reaction_falls_back_to_pending_queue_when_core_message_id_empty(monkeypatch) -> None:
+    """核心对 OneBot 入站不绑定 HERMES_SESSION_MESSAGE_ID，必须回落到队列。"""
+    ctx, config = _register_reaction_plugin(
+        monkeypatch, extra={"reaction_on_mention": True, "require_mention": False},
+    )
+    adapter = ctx.platform["adapter_factory"](config)
+    _capture_handle_message(adapter)
+    calls = []
+
+    async def fake_call(action, params, timeout=30.0):
+        calls.append((action, params["message_id"]))
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+
+    async def run():
+        await adapter._process_message(_reaction_mention_event(4242))
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], message_id="")
+        # 第二次同样为空：队列已空，不能重复贴
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], message_id="")
+
+    asyncio.run(run())
+    assert calls == [("set_msg_emoji_like", 4242)]
 
 
 def test_reaction_private_message_is_not_recorded(monkeypatch) -> None:
@@ -1061,7 +1089,7 @@ def test_reaction_private_message_is_not_recorded(monkeypatch) -> None:
         event["message_type"] = "private"
         await adapter._process_message(event)
         assert len(captured) == 1
-        assert adapter._mentioned_messages == {}
+        assert adapter._pending_mentions == {}
         await _fire_reaction_stream_start(
             ctx.hooks["on_stream_start"], chat_id="private:10002", chat_type="dm",
         )
@@ -1144,7 +1172,7 @@ def test_reaction_action_failure_is_silent_and_next_message_works(monkeypatch, c
 def test_reaction_message_caches_evict_oldest_entries(monkeypatch) -> None:
     ctx, config = _register_reaction_plugin(monkeypatch, extra={"reaction_on_mention": True})
     adapter = ctx.platform["adapter_factory"](config)
-    monkeypatch.setattr(adapter, "_REACTION_MAX_MESSAGES", 2)
+    monkeypatch.setattr(adapter, "_REACTION_MAX_PENDING_PER_CHAT", 2)
     _capture_handle_message(adapter)
     calls = []
 
@@ -1161,8 +1189,9 @@ def test_reaction_message_caches_evict_oldest_entries(monkeypatch) -> None:
         await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], message_id="1")
 
     asyncio.run(run())
-    assert list(adapter._mentioned_messages) == [2, 3]
-    assert list(adapter._reacted_messages) == [2, 3]
+    # 每次贴完就从队列里取走；三次都贴到，且重复 hint 不会再贴
+    assert not adapter._pending_mentions.get("group:888888")
+    assert list(adapter._reacted_messages) == [1, 2, 3]
     assert calls == [1, 2, 3]
 
 

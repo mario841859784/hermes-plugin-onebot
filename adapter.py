@@ -51,7 +51,8 @@ import urllib.parse
 import uuid
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +406,9 @@ class OneBotAdapter(BasePlatformAdapter):
 
     # FIFO bounds for explicit @ messages and reaction attempts (no disk state).
     _REACTION_MAX_MESSAGES: int = 256
+    _REACTION_MAX_PENDING_PER_CHAT: int = 8
+    _REACTION_MAX_CHATS: int = 128
+    _REACTION_PENDING_TTL_SECONDS: float = 300.0
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -507,7 +511,9 @@ class OneBotAdapter(BasePlatformAdapter):
         # Only the adapter's event loop reads/writes these caches. The sync
         # stream observer runs on a worker thread and schedules back to it.
         self._reaction_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._mentioned_messages: Dict[int, str] = {}  # message_id -> chat_id
+        # chat_id -> [(message_id, recorded_at)] in arrival order. Per-chat turns
+        # are serial, so the head is the message the running turn answered.
+        self._pending_mentions: Dict[str, Deque[Tuple[int, float]]] = {}
         self._reacted_messages: Dict[int, None] = {}  # attempted, even on failure
         self._member_chats: set = set()  # 普通用户受限会话（出站敏感审计用）
         self._nicknames: Dict[str, str] = {}  # chat_id -> last known user nickname
@@ -1852,18 +1858,49 @@ class OneBotAdapter(BasePlatformAdapter):
             logger.debug("[onebot] mention reaction skipped: invalid message_id")
             return
         self._reaction_loop = asyncio.get_running_loop()
-        self._mentioned_messages[mid] = chat_id
-        if len(self._mentioned_messages) > self._REACTION_MAX_MESSAGES:
-            self._mentioned_messages.pop(next(iter(self._mentioned_messages)))
+        queue = self._pending_mentions.setdefault(chat_id, deque())
+        queue.append((mid, time.time()))
+        while len(queue) > self._REACTION_MAX_PENDING_PER_CHAT:
+            queue.popleft()
+        if len(self._pending_mentions) > self._REACTION_MAX_CHATS:
+            self._pending_mentions.pop(next(iter(self._pending_mentions)))
+
+    def _current_mention_id(self, chat_id: str, hint: str) -> Optional[int]:
+        """Which @ the running turn belongs to.
+
+        Core binds HERMES_SESSION_MESSAGE_ID only when the source carries one;
+        the OneBot path leaves it empty, so fall back to the oldest pending @
+        for this chat (turns in one chat run serially).
+        """
+        queue = self._pending_mentions.get(chat_id)
+        if queue:
+            cutoff = time.time() - self._REACTION_PENDING_TTL_SECONDS
+            while queue and queue[0][1] < cutoff:
+                queue.popleft()
+            if not queue:
+                self._pending_mentions.pop(chat_id, None)
+        if hint:
+            try:
+                hinted = int(hint)
+            except (TypeError, ValueError):
+                return None
+            if not any(mid == hinted for mid, _ in queue or ()):
+                # A concrete id that is not an @ we recorded: this turn was not
+                # triggered by a mention we know about, so do not fall back to
+                # whatever happens to be queued.
+                return None
+            while queue and queue[0][0] != hinted:
+                queue.popleft()
+            queue.popleft()
+            return hinted
+        if queue:
+            return queue.popleft()[0]
+        return None
 
     async def _react_to_mention(self, chat_id: str, message_id: int) -> None:
         """Best-effort receipt, once per message, on the OneBot event loop."""
         try:
-            if (
-                not self._reaction_on_mention
-                or self._mentioned_messages.get(message_id) != chat_id
-                or message_id in self._reacted_messages
-            ):
+            if not self._reaction_on_mention or message_id in self._reacted_messages:
                 return
             # Mark before awaiting: repeated streams (including tool rounds)
             # cannot send another reaction while this action is in flight.
@@ -3764,15 +3801,19 @@ def _build_adapter(config):
 _LIVE_ADAPTERS: "List[weakref.ref]" = []
 
 
-def _adapter_for_mention(message_id: int, chat_id: str) -> Optional[OneBotAdapter]:
-    """Live adapter that recorded this group @ (exact chat + message match)."""
+def _adapter_for_chat(chat_id: str) -> Optional[OneBotAdapter]:
+    """Live adapter that has a pending @ recorded for this chat.
+
+    Multi-profile: pick the instance that actually saw the message instead of
+    "the most recent one", which would silently drop the reaction.
+    """
     for ref in reversed(_LIVE_ADAPTERS):
         adapter = ref()
         if adapter is None:
             continue
         if not adapter._reaction_on_mention:
             continue
-        if adapter._mentioned_messages.get(message_id) == chat_id:
+        if adapter._pending_mentions.get(chat_id):
             return adapter
     _LIVE_ADAPTERS[:] = [r for r in _LIVE_ADAPTERS if r() is not None]
     return None
@@ -3805,12 +3846,19 @@ def _on_stream_start(**_kwargs) -> None:
         ):
             return
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
-        message_id = int(get_session_env("HERMES_SESSION_MESSAGE_ID"))
-        # Pick the adapter that actually recorded this message: with several
+        hint = get_session_env("HERMES_SESSION_MESSAGE_ID")
+        # Pick the adapter that actually recorded this chat's @: with several
         # live instances (multi-profile) a lone "most recent" adapter would
-        # drop the reaction (its own table cannot recognise the id).
-        adapter = _adapter_for_mention(message_id, chat_id)
+        # drop the reaction.
+        adapter = _adapter_for_chat(chat_id)
         if adapter is None:
+            logger.debug("[onebot] mention reaction skipped: no pending @ for %s", chat_id)
+            return
+        # Core leaves HERMES_SESSION_MESSAGE_ID empty for OneBot inbound
+        # messages, so the adapter's per-chat pending queue supplies the id.
+        message_id = adapter._current_mention_id(chat_id, hint)
+        if message_id is None:
+            logger.debug("[onebot] mention reaction skipped: pending @ expired for %s", chat_id)
             return
         loop = adapter._reaction_loop
         if loop is None or loop.is_closed() or not loop.is_running():
