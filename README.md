@@ -104,6 +104,8 @@ gateway:
         admin_users: []            # admins; falls back to ONEBOT_ALLOWED_USERS
         text_image_threshold: 150  # longer replies render as a text image
         image_max_size: 2048       # downscale inbound images (0 = keep as-is)
+        image_attach_max: 3        # photos attached on their own per message
+        image_grid: true           # stickers + extra photos -> one numbered grid
         poke_reply: false          # light reply when the bot itself gets poked
 ```
 
@@ -124,6 +126,8 @@ gateway:
 | `admin_users` | `[]` | admin QQ ids; falls back to `ONEBOT_ALLOWED_USERS` |
 | `text_image_threshold` | `150` | t2i card threshold; `<=0` disables the card path. A legacy `split_length` key in existing configs is silently ignored — replies are never split |
 | `image_max_size` | `2048` | inbound image long-edge cap (px); `0` keeps originals |
+| `image_attach_max` | `3` | photos per message attached as their own image; the rest go into the grid |
+| `image_grid` | `true` | stitch stickers and photos beyond `image_attach_max` into one numbered grid image; `false` attaches every picture separately |
 | `max_inbound_file_bytes` | `20971520` (20 MB) | inbound file size cap; larger files degrade to a `[文件:name]` marker |
 | `interim_recall_seconds` | `90` | auto-recall timeout for unsettled interim messages (`0` disables) |
 | `outbound_image_max_bytes` | `8388608` (8 MB) | t2i card PNG cap (base64 length); over-cap warns and falls back to a single text message |
@@ -366,6 +370,8 @@ macOS needs nothing (system Hiragino Sans GB / Songti SC, Menlo and Apple Color 
 - Inbound messages are parsed as the **OneBot segment array** (`message` field) when available. Image/voice/at/face/video/file segments are handled structurally; text-format clients fall back to CQ-code string parsing. CQ entity escaping (`&amp;` → `&`, `&#91;` → `[`, …) is reversed before any URL is used, so CDN links with `&` parameters download correctly.
 - Images are downloaded to a temp directory and exposed to the vision tool via `media_urls`; undownloadable images degrade to a `[图片]` placeholder. If the image segment only carries a `file` hash (no URL), the adapter calls the OneBot `get_image` action to resolve the real URL; `base64://` and `file://` forms are handled directly.
 - Images larger than `image_max_size` (default **2048** px on the long edge) are downscaled with Pillow before the LLM sees them. High-resolution QQ photos otherwise make vision calls slow or time out. RGBA stays PNG, everything else becomes JPEG (q85); animated GIFs collapse to their first frame. Set `image_max_size: 0` to keep originals untouched.
+- Pictures are numbered in the text in reading order — `[图片N]` for photos, `[表情N]` for stickers (`sub_type=1` images and `mface` store stickers) — so the model can tell which is which; a picture that failed to download keeps the bare `[图片]` / `[表情]`. Pictures from a quoted message come first, matching the `[引用]` text.
+- When a message carries several pictures, stickers and the photos beyond `image_attach_max` are stitched into one 768 px wide grid with each cell labeled by its number (up to 9 per grid). Vision models bill per image, so nine stickers cost about one image instead of nine. Photos (usually screenshots someone wants read) stay attached on their own at full `image_max_size`. A note at the end of the text says which attachment is which, and stickers additionally carry their original file paths so the model can pull the full-size image by path; the grid comes first. A grid of one picture saves nothing, so a lone extra picture is attached as-is (the path note still applies).
 
 ## Inbound files
 

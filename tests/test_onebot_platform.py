@@ -2084,11 +2084,14 @@ def test_card_plain_neutralizes_hostile_fields() -> None:
 
 
 def test_parse_message_array_sticker_mface_card(monkeypatch) -> None:
-    """段数组路径：sticker/mface 占自己的位置，json 段转可读卡片。"""
+    """段数组路径：sticker/mface/照片都进占位字符管线（编号后路径进 picture_note），
+    json 段转可读卡片；无 url 的 mface 留 [表情包]。"""
+    from onebot_platform import onebot_utils as ou
+
     adapter = _make_adapter()
 
     async def fake_resolve(url, file):
-        return f"/tmp/fake_{(url or 'x').split('/')[-1]}"
+        return f"/tmp/fake_{(url or 'x').split('/')[-1]}" if url else None
 
     monkeypatch.setattr(adapter, "_resolve_image", fake_resolve)
     segments = [
@@ -2100,16 +2103,18 @@ def test_parse_message_array_sticker_mface_card(monkeypatch) -> None:
         {"type": "json", "data": {"data": '{"meta":{"n":{"title":"卡标题","url":"https://x.io/c"}}}'}},
     ]
     text, media, types, _ = asyncio.run(adapter._parse_message_array(segments))
-    assert "[表情包:/tmp/fake_aaa111.png]" in text
-    assert "[图片]" in text
-    assert "[表情包:/tmp/fake_ccc333.png]" in text
+    # 占位字符按序：表情包（sub_type=1）/照片/mface 下载成功=占位字符，等 number_pictures 编号
+    assert ou.number_pictures(text)[0] == "[表情1]看这个[图片2][表情3][表情包][卡片:卡标题 https://x.io/c]"
     assert text.count("[表情包]") == 1  # 无 url 的 mface
     assert "[卡片:卡标题 https://x.io/c]" in text
-    assert len(media) == 3 and all(t == "image" for t in types)
+    assert media == ["/tmp/fake_aaa111.png", "/tmp/fake_bbb222.png", "/tmp/fake_ccc333.png"]
+    assert all(t == "image" for t in types)
 
 
 def test_parse_content_sticker_cq_path(monkeypatch) -> None:
-    """CQ 字符串路径：sub_type=1 的图片占表情包位置，普通图片仍是 [图片]。"""
+    """CQ 字符串路径：sub_type=1 的图占表情包位，普通图占照片位，按序进编号管线。"""
+    from onebot_platform import onebot_utils as ou
+
     adapter = _make_adapter()
 
     async def fake_resolve(url, file):
@@ -2118,7 +2123,7 @@ def test_parse_content_sticker_cq_path(monkeypatch) -> None:
     monkeypatch.setattr(adapter, "_resolve_image", fake_resolve)
     raw = "[CQ:image,sub_type=1,url=https://cdn/s.png][CQ:image,url=https://cdn/p.png]"
     text, media, types = asyncio.run(adapter._parse_content(raw))
-    assert text == "[表情包:/tmp/fake_sticker.png][图片]"
+    assert ou.number_pictures(text)[0] == "[表情1][图片2]"
     assert media == ["/tmp/fake_sticker.png", "/tmp/fake_sticker.png"]
     assert types == ["image", "image"]
 
@@ -2601,7 +2606,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.10.0" in t for t in texts)
+    assert any("onebot-plugin v1.11.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -4928,6 +4933,206 @@ def test_cleanup_tmp_files_sweeps_legacy_tmp_dir(monkeypatch) -> None:
     assert not old.exists()
     assert keep.exists()
     assert not legacy_old.exists()
+
+
+# ---------------------------------------------------------------------------
+# Inbound pictures: numbered in the text; stickers and extra photos are
+# stitched into one numbered grid so several pictures cost one image read
+# ---------------------------------------------------------------------------
+
+
+def test_number_pictures_labels_in_text_order() -> None:
+    from onebot_platform import onebot_utils as ou
+
+    text, kinds = ou.number_pictures(f"看{ou.PHOTO_MARK}和{ou.STICKER_MARK}，这张没下下来[图片]")
+    assert text == "看[图片1]和[表情2]，这张没下下来[图片]"
+    assert kinds == ["photo", "sticker"]
+
+
+def test_plan_pictures() -> None:
+    from onebot_platform.onebot_utils import plan_pictures
+
+    assert plan_pictures(["photo"], 3) == ([0], [])
+    assert plan_pictures(["photo", "sticker"], 3) == ([0, 1], [])  # 只剩 1 张可拼：拼了不省，单独附
+    assert plan_pictures(["sticker"] * 3, 3) == ([], [[0, 1, 2]])
+    assert plan_pictures(["photo"] * 5, 3) == ([0, 1, 2], [[3, 4]])
+    assert plan_pictures(["sticker"] * 11, 3) == ([], [list(range(9)), [9, 10]])
+    assert plan_pictures(["photo", "sticker", "sticker"], 0) == ([], [[0, 1, 2]])
+
+
+def test_make_picture_grid_layout(tmp_path) -> None:
+    import io
+
+    from PIL import Image
+
+    from onebot_platform.onebot_utils import make_picture_grid
+
+    paths = []
+    for i in range(5):
+        p = tmp_path / f"{i}.png"
+        Image.new("RGB", (900, 300), "blue").save(p)
+        paths.append(str(p))
+    paths[1] = str(tmp_path / "missing.png")  # 打不开的留空格，不报错
+    grid = Image.open(io.BytesIO(make_picture_grid(paths, [1, 2, 3, 4, 5])))
+    assert grid.size == (768, 512)  # 5 张 → 3 列 × 2 行，256px 一格
+    assert Image.open(io.BytesIO(make_picture_grid(paths[:2], [1, 2]))).size == (768, 384)
+
+
+def test_picture_note() -> None:
+    from onebot_platform.onebot_utils import picture_note, sticker_path_note
+
+    kinds = ["photo", "sticker", "sticker", "photo"]
+    assert picture_note(kinds, [0, 3], [[1, 2]]) == (
+        "（第 1 张附图是 [表情2]、[表情3] 拼成的一张图，格子左上角的数字就是编号；其余附图依次是 [图片1]、[图片4]）"
+    )
+    # 融合 dsh PR #44：表情包附原文件路径（网格外可按路径引用原图）
+    assert picture_note(kinds, [0, 3], [[1, 2]], {2: "/m/s2.gif", 3: "/m/s3.gif"}) == (
+        "（第 1 张附图是 [表情2]、[表情3] 拼成的一张图，格子左上角的数字就是编号；"
+        "其余附图依次是 [图片1]、[图片4]；表情原文件路径：[表情2] /m/s2.gif、[表情3] /m/s3.gif）"
+    )
+    assert sticker_path_note({2: "/m/s2.gif"}) == "（表情原文件路径：[表情2] /m/s2.gif）"
+
+
+def _picture_event(monkeypatch, tmp_path, segments, **extra):
+    """发一条带图的私聊，返回构造出的事件（下载换成本地生成的 PNG）。"""
+    from PIL import Image
+
+    adapter = _make_adapter(admin_users=[123456789], **extra)
+    adapter._ws = _FakeWS(adapter)
+    captured: list = []
+
+    async def fake_handle_message(ev):
+        captured.append(ev)
+
+    async def fake_resolve_image(url, file):
+        if not url:
+            return None
+        p = tmp_path / (url.rsplit("/", 1)[-1] + ".png")
+        Image.new("RGB", (300, 300), "green").save(p)
+        return str(p)
+
+    adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
+    monkeypatch.setattr(adapter, "_resolve_image", fake_resolve_image)
+    asyncio.run(
+        adapter._process_message(
+            {"message_type": "private", "user_id": 123456789, "self_id": 123456789, "message": segments}
+        )
+    )
+    assert captured, "no event captured"
+    return captured[0]
+
+
+_SHOT_AND_STICKERS = [
+    {"type": "text", "data": {"text": "看看"}},
+    {"type": "image", "data": {"url": "https://cdn/shot", "file": "shot.jpg", "sub_type": 0}},
+    {"type": "image", "data": {"url": "https://cdn/s1", "file": "s1.gif", "sub_type": 1}},
+    {"type": "mface", "data": {"url": "https://cdn/s2", "summary": "[开心]"}},
+    {"type": "image", "data": {"url": "https://cdn/s3", "file": "s3.gif", "sub_type": "1"}},
+]
+
+
+def test_inbound_stickers_stitched_into_one_grid(monkeypatch, tmp_path) -> None:
+    """1 张截图 + 3 个表情包：截图单独附，3 个表情包拼成一张；文本编号和附图对得上，
+    尾注交代表情包原文件路径（dsh PR #44 意图）。边界包裹在编号外，尾注在边界外。"""
+    ev = _picture_event(monkeypatch, tmp_path, _SHOT_AND_STICKERS)
+    body, note = ev.text.split("</user_message>\n", 1)
+    assert body.endswith("看看[图片1][表情2][表情3][表情4]\n")
+    assert note.startswith(
+        "（第 1 张附图是 [表情2]、[表情3]、[表情4] 拼成的一张图，格子左上角的数字就是编号；"
+        "其余附图依次是 [图片1]；表情原文件路径："
+    )
+    for i, name in ((2, "s1.png"), (3, "s2.png"), (4, "s3.png")):
+        assert f"[表情{i}] {tmp_path / name}" in note
+    assert len(ev.media_urls) == 2 and ev.media_types == ["image", "image"]
+    assert Path(ev.media_urls[0]).name.startswith("grid_")
+    assert ev.media_urls[1] == str(tmp_path / "shot.png")
+
+
+def test_single_sticker_gets_path_note_without_grid(monkeypatch, tmp_path) -> None:
+    """只有 1 个表情包：拼了不省、直接单独附，路径仍按 PR #44 意图交代给模型。"""
+    ev = _picture_event(
+        monkeypatch,
+        tmp_path,
+        [
+            {"type": "text", "data": {"text": "哈哈"}},
+            {"type": "mface", "data": {"url": "https://cdn/alone", "summary": "[开心]"}},
+        ],
+    )
+    body, note = ev.text.split("</user_message>\n", 1)
+    assert body.endswith("哈哈[表情1]\n")
+    assert note == f"（表情原文件路径：[表情1] {tmp_path / 'alone.png'}）"
+    assert ev.media_urls == [str(tmp_path / "alone.png")]
+
+
+def test_cq_mface_and_image_marks_follow_raw_order(monkeypatch, tmp_path) -> None:
+    """CQ 路径 mface 与 image 混排：编号按 raw 顺序，附图顺序与文本一致（防错位）。"""
+    from onebot_platform import onebot_utils as ou
+
+    adapter = _make_adapter()
+
+    async def fake_resolve(url, file):
+        if not url:
+            return None
+        p = tmp_path / (url.rsplit("/", 1)[-1] + ".png")
+        p.write_bytes(b"x")
+        return str(p)
+
+    monkeypatch.setattr(adapter, "_resolve_image", fake_resolve)
+    raw = "[CQ:mface,url=https://cdn/m1]看[CQ:image,url=https://cdn/p1][CQ:image,sub_type=1,url=https://cdn/m2]"
+    text, media, types = asyncio.run(adapter._parse_content(raw))
+    numbered, kinds = ou.number_pictures(text)
+    assert numbered == "[表情1]看[图片2][表情3]" and kinds == ["sticker", "photo", "sticker"]
+    assert [Path(m).name for m in media] == ["m1.png", "p1.png", "m2.png"]
+    assert types == ["image", "image", "image"]
+
+
+def test_image_grid_off_attaches_one_by_one(monkeypatch, tmp_path) -> None:
+    ev = _picture_event(monkeypatch, tmp_path, _SHOT_AND_STICKERS, image_grid=False)
+    body, note = ev.text.split("</user_message>\n", 1)
+    assert body.endswith("看看[图片1][表情2][表情3][表情4]\n")
+    assert note.startswith("（表情原文件路径：")
+    assert f"[表情2] {tmp_path / 's1.png'}" in note
+    assert len(ev.media_urls) == 4
+
+
+def test_quoted_pictures_numbered_before_the_message(monkeypatch, tmp_path) -> None:
+    """引用原文排在文本前面，它的图也排在附图前面，编号才对得上。"""
+    adapter_calls = {}
+
+    async def fake_call_action(action, params, timeout=30.0):
+        adapter_calls[action] = params
+        return {"message": [{"type": "image", "data": {"url": "https://cdn/quoted", "file": "q.jpg"}}]}
+
+    from onebot_platform.adapter import OneBotAdapter as _A
+
+    monkeypatch.setattr(_A, "_call_action", lambda self, *a, **k: fake_call_action(*a, **k))
+    ev = _picture_event(
+        monkeypatch,
+        tmp_path,
+        [
+            {"type": "reply", "data": {"id": 777}},
+            {"type": "text", "data": {"text": "这张和"}},
+            {"type": "image", "data": {"url": "https://cdn/mine", "file": "m.jpg"}},
+        ],
+    )
+    assert ev.text.partition("</user_message>")[0].endswith("[引用][图片1]\n这张和[图片2]\n")
+    assert ev.media_urls == [str(tmp_path / "quoted.png"), str(tmp_path / "mine.png")]
+
+
+def test_cq_string_pictures_get_marks_in_order(monkeypatch, tmp_path) -> None:
+    """CQ 字符串路径：每个 CQ:image 一个占位，下载失败的保留不带编号的 [图片]。"""
+    from onebot_platform import onebot_utils as ou
+
+    adapter = _make_adapter()
+
+    async def fake_resolve_image(url, file):
+        return str(tmp_path / "ok.png") if url else None
+
+    monkeypatch.setattr(adapter, "_resolve_image", fake_resolve_image)
+    raw = "[CQ:image,file=a.gif,url=https://cdn/a.gif,sub_type=1]看[CQ:image,file=deadbeef]"
+    text, media, types = asyncio.run(adapter._parse_content(raw))
+    assert ou.number_pictures(text)[0] == "[表情1]看[图片]"
+    assert media == [str(tmp_path / "ok.png")] and types == ["image"]
 
 
 # ---------------------------------------------------------------------------
