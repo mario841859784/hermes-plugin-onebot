@@ -25,6 +25,7 @@ User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
 | Text image | AstrBot-style t2i card renderer: headings / bold / italic / strikethrough / quote / list / code block / **table** / inline-code pill / color emoji / CJK punctuation rules; 800 px wide |
 | Outbound | two-tier send, **no auto splitting** (≤ threshold one text bubble, above it a t2i card), **card PNG size cap with text fallback**, markdown stripped to plain text, **echoed `<user_message>` boundary tags stripped**, `[[qq_forward]]` merged forwarding, **loop interim merge + recall** (turn-end **"本轮进展" summary card**, 60 ms recall spacing), typing indicator (private chats) |
 | Commands | admin-only local slash commands: `/ocr` / `/mode` / `/id` / `/ver` / `/approve` / `/reject`; other slashes keep flowing to the gateway core |
+| Message reactions | Optional group @ receipt when the model first starts streaming (`reaction_on_mention`, off by default) |
 | Tools | `qq_send_image` (≤9, path or URL, caption markdown-stripped), `qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`, `qq_send_segments` (explicit 1–9 bubbles, you split the text; `intervalMs` per-call breathing gap; `segments_enabled` switch), `qq_napcat_api` (15-action whitelist), `qq_group_history`; HTTP `/api/napcat` + `/api/send_media` + `/api/write_gate_stats`; available in CLI/TUI too via `provides_tools` |
 | Permissions | admin allowlist (`ONEBOT_ALLOWED_USERS`), dm/group policy (open/allowlist/disabled), group mention gating, restricted-member `[受限用户:仅问答]` soft limits, outbound sensitive-intent audit |
 | Ops | hot reload for `onebot_utils.py` / `t2i_render.py` (`extra.hot_reload`, no gateway restart), temp-media TTL cleanup, startup t2i ink check (font chain self-test) |
@@ -35,6 +36,7 @@ User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
 |---|---|
 | Hermes | gateway with the onebot platform enabled |
 | OneBot 11 bridge | NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma (reverse or forward WebSocket) |
+| Message reactions | NapCat only (`set_msg_emoji_like`) |
 | Optional deps | `ffmpeg` on the Hermes host for voice transcription (the adapter probes it once at startup and logs a WARNING — voice STT stays off until you install it); an STT backend configured under `stt:` (local faster-whisper, auto-downloaded on first use, or an OpenAI-compatible API); CJK fonts for text-image cards (see below) |
 
 ## Install (standalone repo)
@@ -97,6 +99,8 @@ gateway:
         # access_token: ""         # must match the bridge's token; REQUIRED when host is 0.0.0.0
         # bot_qq: ""               # optional; auto-learned from meta events
         require_mention: true      # groups: only reply when @'d
+        reaction_on_mention: false # group @ receipt when the model starts streaming
+        reaction_emoji: 178        # QQ smile reaction
         dm_policy: open            # open | allowlist | disabled
         allow_from: []             # user ids when dm_policy=allowlist
         group_policy: open         # open | allowlist | disabled
@@ -119,6 +123,8 @@ gateway:
 | `access_token` | empty | OneBot token, must match the bridge |
 | `bot_qq` | empty | bot's QQ (empty = learned from meta events) |
 | `require_mention` | `true` | groups: only respond when @'d or replying to the bot (undeterminable replies fall back to responding) |
+| `reaction_on_mention` | `false` | react to an explicit group @ when the model first starts streaming; NapCat only |
+| `reaction_emoji` | `178` | QQ emoji ID for the receipt (default: smile) |
 | `dm_policy` | `open` | `open` (admins only) / `allowlist` / `disabled` |
 | `allow_from` | `[]` | allowed user ids when `dm_policy=allowlist` |
 | `group_policy` | `open` | `open` / `allowlist` / `disabled` |
@@ -313,6 +319,8 @@ main message flow.
 ## Group mentions
 
 With `require_mention: true` (default), the bot only responds in groups when it is explicitly @'d or when the message replies to a message the bot itself sent. Replying to someone else stays silent, so busy groups are no longer woken by unrelated reply chains. The replied-to message is resolved with `get_msg` — the same fetch used for quote text, so there is no extra API call — and when the sender cannot be determined (fetch failed or timed out, the original message was recalled and deleted, or the bot's own id is still unknown) the bot falls back to treating the reply as a mention, so replies to recalled messages still trigger. Set it to `false` to respond to every group message (noisy; not recommended for large groups). When no `bot_qq` is configured the bot learns its own id from OneBot meta events, so mention detection works out of the box.
+
+Set `reaction_on_mention: true` for a visible "received, processing" receipt on an explicit group @ when the model first starts streaming. It defaults to `false`; `reaction_emoji` defaults to QQ smile `178`. Each message gets at most one attempt. Private chats and reply-only triggers are skipped. This requires NapCat's `set_msg_emoji_like`; failures are logged at debug level and replies continue. Enabling the feature opts Hermes into streaming model requests; when disabled, no stream hook is registered.
 
 ## Long replies (two tiers, fully configurable)
 

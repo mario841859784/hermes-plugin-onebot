@@ -25,6 +25,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 | 命令 | 管理员本地斜杠命令：`/ocr` / `/mode` / `/id` / `/ver` / `/approve` / `/reject`；其余斜杠照常流转网关核心 |
 | 工具 | `qq_send_image`（≤9 张，路径或 URL，caption 剥离 Markdown）、`qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`、`qq_send_segments`（显式分条 1–9 段，自行拆好每段；`intervalMs` 按次覆盖呼吸间隔；`segments_enabled` 可下线）、`qq_napcat_api`（15 个白名单 action）、`qq_group_history`；HTTP `/api/napcat` + `/api/send_media` + `/api/write_gate_stats`；`provides_tools` 让 CLI/TUI 也可用 |
 | 权限 | 管理员白名单（`ONEBOT_ALLOWED_USERS`）、dm/group 策略（open/allowlist/disabled）、群聊 @ 门控、受限成员 `[受限用户:仅问答]` 软限制、出站敏感意图审计 |
+| 消息表情回应 | 群聊被 @ 后，模型首次开始流式输出时贴表情回执（`reaction_on_mention`，默认关闭） |
 | 运维 | 热加载 `onebot_utils.py` / `t2i_render.py`（`extra.hot_reload`，免网关重启）、临时媒体 TTL 清理、启动时 t2i 墨源自检（字体链自测） |
 
 ## 兼容性
@@ -33,6 +34,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 |---|---|
 | Hermes | 网关启用 onebot 平台 |
 | OneBot 11 桥 | NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma（反向或正向 WebSocket） |
+| 消息表情回应 | 仅 NapCat（`set_msg_emoji_like`） |
 | 可选依赖 | Hermes 主机上装 `ffmpeg` 用于语音转写（适配器启动时探测一次，缺失即打 WARNING——装上前语音转文字不可用）；`stt:` 下配置 STT 后端（本地 faster-whisper 首次使用自动下载，或 OpenAI 兼容 API）；文字图卡片需要 CJK 字体（见下） |
 
 ## 安装（独立仓）
@@ -95,6 +97,8 @@ gateway:
         # access_token: ""         # 必须与桥的 token 一致；host 为 0.0.0.0 时必配
         # bot_qq: ""               # 可选；自动从 meta 事件学习
         require_mention: true      # 群聊：仅被 @ 时回复
+        reaction_on_mention: false # 模型开始流式输出时给群 @ 消息贴回执
+        reaction_emoji: 178        # QQ 微笑表情
         dm_policy: open            # open | allowlist | disabled
         allow_from: []             # dm_policy=allowlist 时的用户 id
         group_policy: open         # open | allowlist | disabled
@@ -117,6 +121,8 @@ gateway:
 | `access_token` | 空 | OneBot token，必须与桥一致 |
 | `bot_qq` | 空 | 机器人 QQ（空 = 从 meta 事件学习） |
 | `require_mention` | `true` | 群聊：仅被 @ 或回复机器人自己时响应（无法判定被回复者时回落为响应） |
+| `reaction_on_mention` | `false` | 模型首次开始流式输出时给显式 @ 机器人的群消息贴表情；仅 NapCat |
+| `reaction_emoji` | `178` | 回执的 QQ 表情 ID（默认「微笑」） |
 | `dm_policy` | `open` | `open`（仅管理员）/ `allowlist` / `disabled` |
 | `allow_from` | `[]` | `dm_policy=allowlist` 时的允许用户 id |
 | `group_policy` | `open` | `open` / `allowlist` / `disabled` |
@@ -291,6 +297,8 @@ base64 内嵌上报的大于 4 MiB 的帧会被拒收。生产传图以 URL（Na
 ## 群 @ 触发
 
 `require_mention: true`（默认）时机器人在群里只响应显式 @ 或回复**机器人自己发的消息**；回复其他人保持沉默，繁忙群不会被无关回复链误唤醒。被回复消息通过 `get_msg` 判定（与引用取原文共用同一次调用，无额外 API 开销）；无法判定被回复者时——取回失败/超时、原消息已撤回删除、或机器人自身 id 未知——回落为算提及（旧行为），防止撤回消息被回复后永不触发。设为 `false` 则响应每条群消息（很吵，大群不推荐）。未配置 `bot_qq` 时机器人从 OneBot meta 事件学自己的 id，@ 检测不需要额外设置。
+
+设 `reaction_on_mention: true` 后，模型第一次开始流式输出时会给显式 @ 机器人的群消息贴表情，作为「已收到、正在处理」的可见回执。默认关闭；`reaction_emoji` 默认为 `178`（微笑）。每条消息仅尝试一次；单纯回复引用和私聊不贴。仅支持 NapCat 的 `set_msg_emoji_like`，失败只记 debug 日志，正常回复照常进行。启用会让 Hermes 请求模型流式输出；关闭时不注册任何流式钩子。
 
 ## 长回复（两档，全可配置）
 
