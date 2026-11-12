@@ -913,3 +913,30 @@ passed + 4 skipped**（v1.10.0 基线 200 + 净增 10，零回归；
 - bool 型 extra 的字符串解析统一（`image_grid: "false"` 现按 truthy 处理）
 - mface 缺 url 时 get_image 兜底（现仅 url 直下，无 url 留 `[表情包]`）
 - `image_attach_max: 0` 语义注明（0 = 全部进拼图，无单独附照片）
+
+## 27. 群 @ 表情回执（2026-11-11，v1.12.0，issue #2）
+
+按维护者确认的方案，在模型第一次开始流式输出时，给显式 @ 机器人的
+群消息贴「已收到、正在处理」表情回执。默认关闭，私聊与单纯回复引用不贴。
+
+### 落点
+
+| 文件 | 改动 |
+|---|---|
+| plugin.yaml | `reaction_on_mention`（bool，false）/ `reaction_emoji`（int，178 微笑）；沿用 hub settings > platforms.onebot.extra > 默认值 |
+| adapter.py 入站 | 在转交 gateway 前记录显式 @ 的 message_id 与 chat_id；段数组优先、CQ 回退，独立于 require_mention，FIFO 上限 256 |
+| adapter.py 钩子 | 仅启用时注册 `on_stream_start`；直接读取事件 ContextVar 快照中的平台、会话类型、chat_id、message_id，复用工厂的模块级 weakref 获取实例；无 pending 队列、无 admission consume 钩子 |
+| adapter.py 动作 | 从同步观察者线程调度回入站事件循环，内部 `_call_action("set_msg_emoji_like", ...)`，message_id 为 int、emoji_id 为 str、timeout 3s；await 前去重，尝试记录 FIFO 上限 256，失败仅 debug，不暴露模型工具 |
+| README 双语 | 功能、配置表、yaml 示例与 Compatibility「仅 NapCat（set_msg_emoji_like）」说明；启用对模型流式请求的影响 |
+| 版本 | plugin.yaml / PLUGIN_VERSION / dashboard manifest / /ver 断言一起更新至 1.12.0 |
+
+### 测试
+
+新增 **24** 个离线用例：关闭时零流式钩子、配置三级优先、群显式 @ 的
+双解析路径、ContextVar 快照在清除会话后仍可用、跨线程回到原事件循环、
+非匹配平台/群/消息与私聊跳过、引用不误贴、进行中的动作去重、异常与
+超时静默且下一条正常、两张消息表 FIFO 淘汰。
+
+- 定向：`test_onebot_platform.py -q -k reaction` → **24 passed, 214 deselected**。
+- 完整：`cd tests && HERMES_AGENT_HOME=/home/ai/.hermes/hermes-agent ../.venv/bin/python -m pytest test_onebot_platform.py -q` → **237 passed, 1 skipped**（25.24s，0 failed；基线列出的两条旧 e2e 本次均通过）。
+- `git diff --check` 通过；测试临时目录、Hermes home、缓存均隔离在本仓库内，禁用外部 Python 字节码写入。

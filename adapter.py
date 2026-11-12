@@ -51,7 +51,8 @@ import urllib.parse
 import uuid
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,7 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.11.0"
+PLUGIN_VERSION = "1.12.0"
 
 # ── 入站媒体下载 SSRF 闸（回移 dsh PR #8/#20，2026-11-07）───────────────
 # 入站图片/语音/视频/文件的 URL 来自协议端，仍是不可信输入：私网/回环/
@@ -403,6 +404,12 @@ class OneBotAdapter(BasePlatformAdapter):
     _MODEL_PICKER_SNAPSHOT_TTL_SECONDS: float = 300.0
     _MODEL_PICKER_SNAPSHOT_MAX_CHATS: int = 256
 
+    # FIFO bounds for explicit @ messages and reaction attempts (no disk state).
+    _REACTION_MAX_MESSAGES: int = 256
+    _REACTION_MAX_PENDING_PER_CHAT: int = 8
+    _REACTION_MAX_CHATS: int = 128
+    _REACTION_PENDING_TTL_SECONDS: float = 300.0
+
     @property
     def enforces_own_access_policy(self) -> bool:
         """本 adapter 在入站自行执行访问策略（dm/group allowlist + 角色分级）。
@@ -466,6 +473,11 @@ class OneBotAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self._outbound_image_max_bytes = IMAGE_MAX_BYTES
         self._require_mention = bool(extra.get("require_mention", True))
+        self._reaction_on_mention = bool(extra.get("reaction_on_mention", False))
+        try:
+            self._reaction_emoji = int(extra.get("reaction_emoji", 178))
+        except (TypeError, ValueError):
+            self._reaction_emoji = 178
         try:
             self._max_inbound_file_bytes = int(extra.get("max_inbound_file_bytes", MEDIA_MAX_BYTES))
         except (TypeError, ValueError):
@@ -496,6 +508,13 @@ class OneBotAdapter(BasePlatformAdapter):
         # Runtime state
         self._ws: Optional[Any] = None  # live OneBot connection (read/write)
         self._self_id: Optional[str] = None  # bot's own QQ, learned from events
+        # Only the adapter's event loop reads/writes these caches. The sync
+        # stream observer runs on a worker thread and schedules back to it.
+        self._reaction_loop: Optional[asyncio.AbstractEventLoop] = None
+        # chat_id -> [(message_id, recorded_at)] in arrival order. Per-chat turns
+        # are serial, so the head is the message the running turn answered.
+        self._pending_mentions: Dict[str, Deque[Tuple[int, float]]] = {}
+        self._reacted_messages: Dict[int, None] = {}  # attempted, even on failure
         self._member_chats: set = set()  # 普通用户受限会话（出站敏感审计用）
         self._nicknames: Dict[str, str] = {}  # chat_id -> last known user nickname
         self._load_nicknames()
@@ -1776,6 +1795,12 @@ class OneBotAdapter(BasePlatformAdapter):
                 media_urls=media_urls,
                 media_types=media_types,
             )
+            if (
+                self._reaction_on_mention
+                and chat_type == "group"
+                and self._is_directly_mentioned(raw, message)
+            ):
+                self._remember_mention(chat_id, event.message_id)
             await self.handle_message(event)
             # 顺带清理过期临时媒体文件（防 plugin-data media 目录无限堆积）
             self._cleanup_tmp_files()
@@ -1810,6 +1835,85 @@ class OneBotAdapter(BasePlatformAdapter):
         if policy == "allowlist":
             return group_id in self._group_allow_from
         return True
+
+    def _is_directly_mentioned(self, raw: str, message: Optional[list] = None) -> bool:
+        """Explicit @ of this bot; reply-only triggers do not get a reaction."""
+        self_id = self._self_id or self._bot_qq or ""
+        if not self_id:
+            return False
+        if isinstance(message, list):
+            return any(
+                isinstance(seg, dict)
+                and seg.get("type") == "at"
+                and str((seg.get("data") or {}).get("qq", "")) == self_id
+                for seg in message
+            )
+        return f"[CQ:at,qq={self_id}]" in raw
+
+    def _remember_mention(self, chat_id: str, message_id: str) -> None:
+        """Record an accepted group @ before the gateway starts its turn."""
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            logger.debug("[onebot] mention reaction skipped: invalid message_id")
+            return
+        self._reaction_loop = asyncio.get_running_loop()
+        queue = self._pending_mentions.setdefault(chat_id, deque())
+        queue.append((mid, time.time()))
+        while len(queue) > self._REACTION_MAX_PENDING_PER_CHAT:
+            queue.popleft()
+        if len(self._pending_mentions) > self._REACTION_MAX_CHATS:
+            self._pending_mentions.pop(next(iter(self._pending_mentions)))
+
+    def _current_mention_id(self, chat_id: str, hint: str) -> Optional[int]:
+        """Which @ the running turn belongs to.
+
+        Core binds HERMES_SESSION_MESSAGE_ID only when the source carries one;
+        the OneBot path leaves it empty, so fall back to the oldest pending @
+        for this chat (turns in one chat run serially).
+        """
+        queue = self._pending_mentions.get(chat_id)
+        if queue:
+            cutoff = time.time() - self._REACTION_PENDING_TTL_SECONDS
+            while queue and queue[0][1] < cutoff:
+                queue.popleft()
+            if not queue:
+                self._pending_mentions.pop(chat_id, None)
+        if hint:
+            try:
+                hinted = int(hint)
+            except (TypeError, ValueError):
+                return None
+            if not any(mid == hinted for mid, _ in queue or ()):
+                # A concrete id that is not an @ we recorded: this turn was not
+                # triggered by a mention we know about, so do not fall back to
+                # whatever happens to be queued.
+                return None
+            while queue and queue[0][0] != hinted:
+                queue.popleft()
+            queue.popleft()
+            return hinted
+        if queue:
+            return queue.popleft()[0]
+        return None
+
+    async def _react_to_mention(self, chat_id: str, message_id: int) -> None:
+        """Best-effort receipt, once per message, on the OneBot event loop."""
+        try:
+            if not self._reaction_on_mention or message_id in self._reacted_messages:
+                return
+            # Mark before awaiting: repeated streams (including tool rounds)
+            # cannot send another reaction while this action is in flight.
+            self._reacted_messages[message_id] = None
+            if len(self._reacted_messages) > self._REACTION_MAX_MESSAGES:
+                self._reacted_messages.pop(next(iter(self._reacted_messages)))
+            await self._call_action(
+                "set_msg_emoji_like",
+                {"message_id": message_id, "emoji_id": str(self._reaction_emoji)},
+                timeout=3.0,
+            )
+        except Exception as e:
+            logger.debug("[onebot] mention reaction failed: %s", e)
 
     def _is_mentioned(
         self,
@@ -3670,16 +3774,49 @@ def _hub_settings() -> Dict[str, Any]:
         return {}
 
 
+def _reaction_on_mention_enabled() -> bool:
+    """Read the opt-in before adapter construction, without discovery locks."""
+    hub = _hub_settings()
+    if "reaction_on_mention" in hub:
+        return bool(hub["reaction_on_mention"])
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        extra = ((cfg.get("platforms") or {}).get("onebot") or {}).get("extra") or {}
+        return bool(extra.get("reaction_on_mention", False))
+    except Exception as e:
+        logger.debug("[onebot] mention reaction setting unavailable: %s", e)
+        return False
+
+
 def _build_adapter(config):
     adapter = OneBotAdapter(config)
     # 模块级活实例引用（弱引用防生命周期延长）：dashboard 插件 API
-    # （dashboard/plugin_api.py，同进程）经 _live_adapter() 读连接态与
-    # 写闸用量，不发网络请求。
+    # 经 _live_adapter() 读状态；on_stream_start 也经此取得 action 实例。
     _LIVE_ADAPTERS.append(weakref.ref(adapter))
     return adapter
 
 
 _LIVE_ADAPTERS: "List[weakref.ref]" = []
+
+
+def _adapter_for_chat(chat_id: str) -> Optional[OneBotAdapter]:
+    """Live adapter that has a pending @ recorded for this chat.
+
+    Multi-profile: pick the instance that actually saw the message instead of
+    "the most recent one", which would silently drop the reaction.
+    """
+    for ref in reversed(_LIVE_ADAPTERS):
+        adapter = ref()
+        if adapter is None:
+            continue
+        if not adapter._reaction_on_mention:
+            continue
+        if adapter._pending_mentions.get(chat_id):
+            return adapter
+    _LIVE_ADAPTERS[:] = [r for r in _LIVE_ADAPTERS if r() is not None]
+    return None
 
 
 def _live_adapter() -> Optional[OneBotAdapter]:
@@ -3696,6 +3833,44 @@ def _is_connected(config) -> bool:
     # Best-effort: connected when config is present; real state lives on the
     # live adapter (checked by the gateway runner).
     return validate_config(config)
+
+
+def _on_stream_start(**_kwargs) -> None:
+    """Use the stream event's ContextVar snapshot, never a pending queue."""
+    try:
+        from gateway.session_context import get_session_env
+
+        if (
+            get_session_env("HERMES_SESSION_PLATFORM") != "onebot"
+            or get_session_env("HERMES_SESSION_CHAT_TYPE") != "group"
+        ):
+            return
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+        hint = get_session_env("HERMES_SESSION_MESSAGE_ID")
+        # Pick the adapter that actually recorded this chat's @: with several
+        # live instances (multi-profile) a lone "most recent" adapter would
+        # drop the reaction.
+        adapter = _adapter_for_chat(chat_id)
+        if adapter is None:
+            logger.debug("[onebot] mention reaction skipped: no pending @ for %s", chat_id)
+            return
+        # Core leaves HERMES_SESSION_MESSAGE_ID empty for OneBot inbound
+        # messages, so the adapter's per-chat pending queue supplies the id.
+        message_id = adapter._current_mention_id(chat_id, hint)
+        if message_id is None:
+            logger.debug("[onebot] mention reaction skipped: pending @ expired for %s", chat_id)
+            return
+        loop = adapter._reaction_loop
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return
+        reaction = adapter._react_to_mention(chat_id, message_id)
+        try:
+            asyncio.run_coroutine_threadsafe(reaction, loop)
+        except Exception:
+            reaction.close()
+            raise
+    except Exception as e:
+        logger.debug("[onebot] mention reaction hook skipped: %s", e)
 
 
 def register(ctx) -> None:
@@ -3729,6 +3904,10 @@ def register(ctx) -> None:
             "politely refuse and explain no permission."
         ),
     )
+    # A stream observer forces streaming in the core even without a gateway
+    # consumer. Register nothing when disabled, preserving the default path.
+    if _reaction_on_mention_enabled():
+        ctx.register_hook("on_stream_start", _on_stream_start)
     # 模型工具（qq_send_* / qq_napcat_api / qq_group_history）：gateway 进程
     # 内也主动注册（CLI/TUI 由 provides_tools 预加载机制负责）。失败不影响
     # 平台本身启动。

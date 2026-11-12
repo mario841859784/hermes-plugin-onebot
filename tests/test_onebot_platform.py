@@ -835,6 +835,366 @@ def test_reply_cq_string_path_matches_array_semantics(monkeypatch) -> None:
     assert len(captured) == 1, "explicit @ must keep working alongside tightened replies"
 
 
+# ---------------------------------------------------------------------------
+# Opt-in group @ reactions (on_stream_start ContextVar snapshots)
+# ---------------------------------------------------------------------------
+
+
+class _ReactionHookContext:
+    def __init__(self):
+        self.platform = {}
+        self.hooks = {}
+        self.tools = {}
+
+    def register_platform(self, **kwargs):
+        self.platform = kwargs
+
+    def register_hook(self, name, callback):
+        self.hooks[name] = callback
+
+    def register_tool(self, **kwargs):
+        self.tools[kwargs["name"]] = kwargs
+
+
+def _register_reaction_plugin(monkeypatch, *, extra=None, settings=None):
+    from hermes_cli import config as config_mod
+    from onebot_platform import adapter as adapter_mod
+
+    config = PlatformConfig(enabled=True, extra=extra or {})
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly",
+        lambda: {
+            "platforms": {"onebot": {"extra": config.extra}},
+            "plugins": {"entries": {"onebot-platform": {"settings": settings or {}}}},
+        },
+    )
+    monkeypatch.setattr(adapter_mod, "_LIVE_ADAPTERS", [])
+    ctx = _ReactionHookContext()
+    adapter_mod.register(ctx)
+    return ctx, config
+
+
+def _reaction_mention_event(message_id=42):
+    event = _group_reply_event(
+        [
+            {"type": "at", "data": {"qq": "123456789"}},
+            {"type": "text", "data": {"text": "在吗"}},
+        ],
+        raw="[CQ:at,qq=123456789] 在吗",
+    )
+    event["message_id"] = message_id
+    return event
+
+
+async def _fire_reaction_stream_start(callback, *, iteration=1, **session):
+    from contextvars import copy_context
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(**{
+        "platform": "onebot", "chat_id": "group:888888",
+        "chat_type": "group", "message_id": "42", **session,
+    })
+    try:
+        snapshot = copy_context()
+    finally:
+        clear_session_vars(tokens)
+    # Match the core's synchronous worker, after the live session is cleared.
+    result = await asyncio.to_thread(
+        snapshot.run, callback, iteration=iteration, surface="cli",
+        telemetry_schema_version=1,
+    )
+    assert result is None
+    # Let the thread-safe submission create and run its task on the owning loop.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("extra,settings,enabled,emoji", [
+    ({}, {}, False, 178),
+    ({"reaction_on_mention": False}, {}, False, 178),
+    ({"reaction_on_mention": True, "reaction_emoji": 66}, {}, True, 66),
+    ({"reaction_on_mention": True, "reaction_emoji": 66},
+     {"reaction_on_mention": False, "reaction_emoji": 128}, False, 128),
+    ({"reaction_on_mention": False, "reaction_emoji": 66},
+     {"reaction_on_mention": True}, True, 66),
+    ({}, {"reaction_on_mention": True}, True, 178),
+    ({"reaction_on_mention": True, "reaction_emoji": "invalid"}, {}, True, 178),
+])
+def test_reaction_hook_registration_and_settings_priority(
+    monkeypatch, extra, settings, enabled, emoji,
+) -> None:
+    """Disabled means zero stream hooks, even before the factory is invoked."""
+    ctx, config = _register_reaction_plugin(monkeypatch, extra=extra, settings=settings)
+    assert set(ctx.hooks) == ({"on_stream_start"} if enabled else set())
+    assert "set_msg_emoji_like" not in ctx.tools
+    adapter = ctx.platform["adapter_factory"](config)
+    assert adapter._reaction_on_mention is enabled
+    assert adapter._reaction_emoji == emoji
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_reaction_on_stream_start_uses_group_mention_snapshot(monkeypatch, structured) -> None:
+    """Both parsing paths record @, even with mention gating disabled."""
+    ctx, config = _register_reaction_plugin(monkeypatch, extra={
+        "reaction_on_mention": True, "reaction_emoji": 66, "require_mention": False,
+    })
+    adapter = ctx.platform["adapter_factory"](config)
+    captured = _capture_handle_message(adapter)
+    calls = []
+
+    async def fake_call(action, params, timeout=30.0):
+        calls.append((action, dict(params), timeout, asyncio.get_running_loop()))
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+
+    async def run():
+        event = _reaction_mention_event()
+        if not structured:
+            event["message"] = None
+        await adapter._process_message(event)
+        assert len(captured) == 1
+        assert calls == [], "receipt must wait for the first stream start"
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"])
+        assert calls == [(
+            "set_msg_emoji_like", {"message_id": 42, "emoji_id": "66"},
+            3.0, asyncio.get_running_loop(),
+        )]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("session", [
+    {"platform": "telegram"},
+    {"chat_type": "dm"},
+    {"chat_type": "private"},
+    {"message_id": "43"},
+    {"chat_id": "group:777"},
+    {"message_id": "invalid"},
+])
+def test_reaction_on_stream_start_ignores_other_sessions(monkeypatch, session) -> None:
+    """A recorded message still needs the correct platform, group and anchor."""
+    ctx, config = _register_reaction_plugin(monkeypatch, extra={"reaction_on_mention": True})
+    adapter = ctx.platform["adapter_factory"](config)
+    _capture_handle_message(adapter)
+    calls = []
+
+    async def fake_call(action, params, timeout=30.0):
+        calls.append((action, params))
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+
+    async def run():
+        await adapter._process_message(_reaction_mention_event())
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], **session)
+
+    asyncio.run(run())
+    assert calls == []
+
+
+@pytest.mark.parametrize("message,raw", [
+    ([{"type": "text", "data": {"text": "普通消息"}}], "普通消息"),
+    ([{"type": "at", "data": {"qq": "99999"}}], "[CQ:at,qq=99999] 在吗"),
+    ([{"type": "reply", "data": {"id": "555"}}], "[CQ:reply,id=555] 在吗"),
+    ([{"type": "text", "data": {"text": "段数组优先"}}], "[CQ:at,qq=123456789] 在吗"),
+])
+def test_reaction_records_only_explicit_bot_mentions(monkeypatch, message, raw) -> None:
+    """Plain messages, other @s and reply-only triggers never get a receipt."""
+    ctx, config = _register_reaction_plugin(monkeypatch, extra={
+        "reaction_on_mention": True, "require_mention": False,
+    })
+    adapter = ctx.platform["adapter_factory"](config)
+    captured = _capture_handle_message(adapter)
+    calls = []
+
+    async def fake_call(action, params, timeout=30.0):
+        calls.append(action)
+        return {"sender": {"user_id": 123456789}, "message": "原文"}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+
+    async def run():
+        await adapter._process_message(_group_reply_event(message, raw=raw))
+        assert len(captured) == 1
+        assert adapter._pending_mentions == {}
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"])
+
+    asyncio.run(run())
+    assert "set_msg_emoji_like" not in calls
+
+
+def test_adapter_for_chat_picks_the_instance_that_saw_the_mention() -> None:
+    """多实例时不能只拿「最近一个」adapter，否则贴不上（拿到的是没排队的实例）。"""
+    import weakref
+
+    from onebot_platform import adapter as adapter_mod
+
+    idle = _make_adapter(reaction_on_mention=True)
+    owner = _make_adapter(reaction_on_mention=True)
+
+    async def seed():
+        owner._remember_mention("group:888888", "77")
+
+    asyncio.run(seed())
+    adapter_mod._LIVE_ADAPTERS[:] = [weakref.ref(idle), weakref.ref(owner)]
+    try:
+        assert adapter_mod._adapter_for_chat("group:888888") is owner
+        assert adapter_mod._adapter_for_chat("group:1") is None
+    finally:
+        adapter_mod._LIVE_ADAPTERS[:] = []
+
+
+def test_reaction_falls_back_to_pending_queue_when_core_message_id_empty(monkeypatch) -> None:
+    """核心对 OneBot 入站不绑定 HERMES_SESSION_MESSAGE_ID，必须回落到队列。"""
+    ctx, config = _register_reaction_plugin(
+        monkeypatch, extra={"reaction_on_mention": True, "require_mention": False},
+    )
+    adapter = ctx.platform["adapter_factory"](config)
+    _capture_handle_message(adapter)
+    calls = []
+
+    async def fake_call(action, params, timeout=30.0):
+        calls.append((action, params["message_id"]))
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+
+    async def run():
+        await adapter._process_message(_reaction_mention_event(4242))
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], message_id="")
+        # 第二次同样为空：队列已空，不能重复贴
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], message_id="")
+
+    asyncio.run(run())
+    assert calls == [("set_msg_emoji_like", 4242)]
+
+
+def test_reaction_private_message_is_not_recorded(monkeypatch) -> None:
+    ctx, config = _register_reaction_plugin(monkeypatch, extra={
+        "reaction_on_mention": True, "admin_users": [10002],
+    })
+    adapter = ctx.platform["adapter_factory"](config)
+    captured = _capture_handle_message(adapter)
+    calls = []
+
+    async def fake_call(action, params, timeout=30.0):
+        calls.append(action)
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+
+    async def run():
+        event = _reaction_mention_event()
+        event["message_type"] = "private"
+        await adapter._process_message(event)
+        assert len(captured) == 1
+        assert adapter._pending_mentions == {}
+        await _fire_reaction_stream_start(
+            ctx.hooks["on_stream_start"], chat_id="private:10002", chat_type="dm",
+        )
+
+    asyncio.run(run())
+    assert calls == []
+
+
+def test_reaction_stream_start_deduplicates_in_flight_action(monkeypatch) -> None:
+    ctx, config = _register_reaction_plugin(monkeypatch, extra={"reaction_on_mention": True})
+    adapter = ctx.platform["adapter_factory"](config)
+    _capture_handle_message(adapter)
+    calls = []
+
+    async def run():
+        started, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def fake_call(action, params, timeout=30.0):
+            calls.append((action, dict(params)))
+            started.set()
+            await release.wait()
+            finished.set()
+            return {}
+
+        monkeypatch.setattr(adapter, "_call_action", fake_call)
+        await adapter._process_message(_reaction_mention_event())
+        try:
+            await _fire_reaction_stream_start(ctx.hooks["on_stream_start"])
+            assert started.is_set()
+            await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], iteration=2)
+            assert len(calls) == 1
+        finally:
+            release.set()
+            await asyncio.wait_for(finished.wait(), timeout=1.0)
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], iteration=3)
+
+    asyncio.run(run())
+    assert calls == [("set_msg_emoji_like", {"message_id": 42, "emoji_id": "178"})]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("unsupported action"), asyncio.TimeoutError()])
+def test_reaction_action_failure_is_silent_and_next_message_works(monkeypatch, caplog, error) -> None:
+    ctx, config = _register_reaction_plugin(monkeypatch, extra={"reaction_on_mention": True})
+    adapter = ctx.platform["adapter_factory"](config)
+    captured = _capture_handle_message(adapter)
+    calls, sent = [], []
+
+    async def fake_call(action, params, timeout=30.0):
+        calls.append((action, dict(params), timeout))
+        if params["message_id"] == 42:
+            raise error
+        return {}
+
+    async def fake_send(*args, **kwargs):
+        sent.append((args, kwargs))
+        return SendResult(success=True)
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+    monkeypatch.setattr(adapter, "send", fake_send)
+
+    async def run():
+        await adapter._process_message(_reaction_mention_event(42))
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"])
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], iteration=2)
+        await adapter._process_message(_reaction_mention_event(43))
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], message_id="43")
+
+    with caplog.at_level(logging.DEBUG, logger="onebot_platform.adapter"):
+        asyncio.run(run())
+    assert [ev.message_id for ev in captured] == ["42", "43"]
+    assert calls == [
+        ("set_msg_emoji_like", {"message_id": 42, "emoji_id": "178"}, 3.0),
+        ("set_msg_emoji_like", {"message_id": 43, "emoji_id": "178"}, 3.0),
+    ]
+    assert sent == [], "reaction errors must not be sent to the user"
+    failures = [r for r in caplog.records if "mention reaction failed" in r.getMessage()]
+    assert len(failures) == 1 and failures[0].levelno == logging.DEBUG
+
+
+def test_reaction_message_caches_evict_oldest_entries(monkeypatch) -> None:
+    ctx, config = _register_reaction_plugin(monkeypatch, extra={"reaction_on_mention": True})
+    adapter = ctx.platform["adapter_factory"](config)
+    monkeypatch.setattr(adapter, "_REACTION_MAX_PENDING_PER_CHAT", 2)
+    _capture_handle_message(adapter)
+    calls = []
+
+    async def fake_call(action, params, timeout=30.0):
+        calls.append(params["message_id"])
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+
+    async def run():
+        for mid in (1, 2, 3):
+            await adapter._process_message(_reaction_mention_event(mid))
+            await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], message_id=str(mid))
+        await _fire_reaction_stream_start(ctx.hooks["on_stream_start"], message_id="1")
+
+    asyncio.run(run())
+    # 每次贴完就从队列里取走；三次都贴到，且重复 hint 不会再贴
+    assert not adapter._pending_mentions.get("group:888888")
+    assert list(adapter._reacted_messages) == [1, 2, 3]
+    assert calls == [1, 2, 3]
+
+
 def test_loop_merge_buffers_interim_then_forwards_and_retracts(monkeypatch) -> None:
     """interim 缓冲 + final 结算：小结卡渲染失败 → 回退合并转发 + 撤回（群聊）。"""
     from onebot_platform import adapter as adapter_mod
@@ -2606,7 +2966,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.11.0" in t for t in texts)
+    assert any("onebot-plugin v1.12.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
