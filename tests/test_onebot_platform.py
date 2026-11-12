@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -632,6 +633,7 @@ def test_quote_reply_fetches_original_text_and_image(monkeypatch) -> None:
     captured: list = []
 
     async def fake_handle_message(ev):
+        ev._gateway_accepted = True  # 模拟核心 base.handle_message 的 admission 标注
         captured.append(ev)
 
     adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
@@ -720,6 +722,7 @@ def _capture_handle_message(adapter: OneBotAdapter) -> list:
     captured: list = []
 
     async def fake_handle_message(ev):
+        ev._gateway_accepted = True  # 模拟核心 base.handle_message 的 admission 标注
         captured.append(ev)
 
     adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
@@ -2966,7 +2969,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.12.0" in t for t in texts)
+    assert any("onebot-plugin v1.12.1" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -5898,3 +5901,87 @@ def test_dashboard_frontend_uses_sanctioned_auth_surface() -> None:
     )
     assert manifest["name"] == "onebot-platform"
     assert manifest["entry"] == "dist/index.js" and manifest["api"] == "plugin_api.py"
+
+
+# ---------------------------------------------------------------------------
+# Mention-reaction follow-ups (PR #3 review): admission-gated recording + lock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_mention_recorded_only_when_gateway_accepts(monkeypatch, accepted) -> None:
+    """v1.12.1：记录时机后移——仅 gateway admission 通过的 @ 才入队。
+
+    被拒收（_gateway_accepted=False）的 @ 不再滞留队列，不会被同 chat
+    下一条无 hint 的 turn 按队头回落贴到从未被回复的旧消息上。
+    """
+    ctx, config = _register_reaction_plugin(
+        monkeypatch, extra={"reaction_on_mention": True, "require_mention": False},
+    )
+    adapter = ctx.platform["adapter_factory"](config)
+    captured: list = []
+
+    async def fake_handle_message(ev):
+        ev._gateway_accepted = accepted
+        captured.append(ev)
+
+    adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
+
+    async def run():
+        await adapter._process_message(_reaction_mention_event(4242))
+
+    asyncio.run(run())
+    assert len(captured) == 1
+    queue = list(adapter._pending_mentions.get("group:888888", ()))
+    if accepted:
+        assert [mid for mid, _ in queue] == [4242]
+    else:
+        assert queue == []
+
+
+def test_pending_mentions_lock_keeps_cross_thread_access_serial() -> None:
+    """v1.12.1：事件循环线程写、worker 线程读并发下，每条 @ 恰好被消费一次。
+
+    无锁时 worker 线程的 check-then-act 可与事件循环线程的入队交错；
+    有锁时整体不变量（消费集合 == 记录集合，恰好一次）始终成立。
+    """
+    adapter = _make_adapter(reaction_on_mention=True)
+    popped: list = []
+    start = threading.Event()
+    stop = threading.Event()
+    total = 500
+
+    def reader():
+        start.wait()
+        while not stop.is_set():
+            mid = adapter._current_mention_id("group:1", "")
+            if mid is not None:
+                popped.append(mid)
+
+    readers = [threading.Thread(target=reader) for _ in range(3)]
+    for t in readers:
+        t.start()
+    start.set()
+
+    async def writer():
+        loop = asyncio.get_running_loop()
+        adapter._reaction_loop = loop
+        for i in range(total):
+            adapter._remember_mention("group:1", str(i))
+            # 单 chat 队列上限 8：写一条等消费一条，防止上限淘汰掩盖
+            # 「恰好一次」不变量（淘汰不是本用例的考察点）
+            while adapter._pending_mentions.get("group:1"):
+                await asyncio.sleep(0)
+
+    asyncio.run(writer())
+    stop.set()
+    for t in readers:
+        t.join()
+    # writer 已停，安全排空残留
+    while True:
+        mid = adapter._current_mention_id("group:1", "")
+        if mid is None:
+            break
+        popped.append(mid)
+
+    assert sorted(popped) == sorted(range(total))

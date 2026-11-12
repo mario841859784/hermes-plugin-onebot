@@ -114,7 +114,7 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.12.0"
+PLUGIN_VERSION = "1.12.1"
 
 # ── 入站媒体下载 SSRF 闸（回移 dsh PR #8/#20，2026-11-07）───────────────
 # 入站图片/语音/视频/文件的 URL 来自协议端，仍是不可信输入：私网/回环/
@@ -508,13 +508,19 @@ class OneBotAdapter(BasePlatformAdapter):
         # Runtime state
         self._ws: Optional[Any] = None  # live OneBot connection (read/write)
         self._self_id: Optional[str] = None  # bot's own QQ, learned from events
-        # Only the adapter's event loop reads/writes these caches. The sync
-        # stream observer runs on a worker thread and schedules back to it.
+        # The adapter's event loop writes these caches; the sync stream observer
+        # runs on a worker thread and reads _pending_mentions back on it
+        # (_adapter_for_chat / _current_mention_id).
         self._reaction_loop: Optional[asyncio.AbstractEventLoop] = None
         # chat_id -> [(message_id, recorded_at)] in arrival order. Per-chat turns
         # are serial, so the head is the message the running turn answered.
+        # 事件循环线程写（_remember_mention）、worker 线程读写
+        # （_current_mention_id / _adapter_for_chat）：实例级锁保证
+        # check-then-act 不跨线程交错（粒度仅覆盖本表操作）。
         self._pending_mentions: Dict[str, Deque[Tuple[int, float]]] = {}
-        self._reacted_messages: Dict[int, None] = {}  # attempted, even on failure
+        self._pending_mentions_lock = threading.Lock()
+        # attempted, even on failure —— 仅事件循环线程访问，不加锁。
+        self._reacted_messages: Dict[int, None] = {}
         self._member_chats: set = set()  # 普通用户受限会话（出站敏感审计用）
         self._nicknames: Dict[str, str] = {}  # chat_id -> last known user nickname
         self._load_nicknames()
@@ -1795,13 +1801,22 @@ class OneBotAdapter(BasePlatformAdapter):
                 media_urls=media_urls,
                 media_types=media_types,
             )
+            await self.handle_message(event)
+            # v1.12.1（PR #3 review）：记录时机后移——base.handle_message 同步
+            # 返回前已在 event 上标注 admission 结果（入口置 _gateway_accepted
+            # =False，接受或成功排队处置 True），故仅在消息确定进入 gateway
+            # turn 后才入队：被拒收的 @ 不再滞留队列，不会被同 chat 下一条
+            # 无 hint 的 turn 按队头贴到从未被回复的旧消息上。残留边界：该
+            # 标志是 handle_message 返回瞬间的判定快照，且依赖当前核心行为
+            # （base.handle_message 在 event 上维护 _gateway_accepted）；
+            # 排队事件此后再被丢弃的极端路径仍会留下一条记录，由 TTL 兜底。
             if (
                 self._reaction_on_mention
                 and chat_type == "group"
                 and self._is_directly_mentioned(raw, message)
+                and getattr(event, "_gateway_accepted", False)
             ):
                 self._remember_mention(chat_id, event.message_id)
-            await self.handle_message(event)
             # 顺带清理过期临时媒体文件（防 plugin-data media 目录无限堆积）
             self._cleanup_tmp_files()
         except Exception as e:
@@ -1851,19 +1866,20 @@ class OneBotAdapter(BasePlatformAdapter):
         return f"[CQ:at,qq={self_id}]" in raw
 
     def _remember_mention(self, chat_id: str, message_id: str) -> None:
-        """Record an accepted group @ before the gateway starts its turn."""
+        """Record an accepted group @ after gateway admission, before streaming."""
         try:
             mid = int(message_id)
         except (TypeError, ValueError):
             logger.debug("[onebot] mention reaction skipped: invalid message_id")
             return
         self._reaction_loop = asyncio.get_running_loop()
-        queue = self._pending_mentions.setdefault(chat_id, deque())
-        queue.append((mid, time.time()))
-        while len(queue) > self._REACTION_MAX_PENDING_PER_CHAT:
-            queue.popleft()
-        if len(self._pending_mentions) > self._REACTION_MAX_CHATS:
-            self._pending_mentions.pop(next(iter(self._pending_mentions)))
+        with self._pending_mentions_lock:
+            queue = self._pending_mentions.setdefault(chat_id, deque())
+            queue.append((mid, time.time()))
+            while len(queue) > self._REACTION_MAX_PENDING_PER_CHAT:
+                queue.popleft()
+            if len(self._pending_mentions) > self._REACTION_MAX_CHATS:
+                self._pending_mentions.pop(next(iter(self._pending_mentions)))
 
     def _current_mention_id(self, chat_id: str, hint: str) -> Optional[int]:
         """Which @ the running turn belongs to.
@@ -1872,30 +1888,31 @@ class OneBotAdapter(BasePlatformAdapter):
         the OneBot path leaves it empty, so fall back to the oldest pending @
         for this chat (turns in one chat run serially).
         """
-        queue = self._pending_mentions.get(chat_id)
-        if queue:
-            cutoff = time.time() - self._REACTION_PENDING_TTL_SECONDS
-            while queue and queue[0][1] < cutoff:
+        with self._pending_mentions_lock:
+            queue = self._pending_mentions.get(chat_id)
+            if queue:
+                cutoff = time.time() - self._REACTION_PENDING_TTL_SECONDS
+                while queue and queue[0][1] < cutoff:
+                    queue.popleft()
+                if not queue:
+                    self._pending_mentions.pop(chat_id, None)
+            if hint:
+                try:
+                    hinted = int(hint)
+                except (TypeError, ValueError):
+                    return None
+                if not any(mid == hinted for mid, _ in queue or ()):
+                    # A concrete id that is not an @ we recorded: this turn was
+                    # not triggered by a mention we know about, so do not fall
+                    # back to whatever happens to be queued.
+                    return None
+                while queue and queue[0][0] != hinted:
+                    queue.popleft()
                 queue.popleft()
-            if not queue:
-                self._pending_mentions.pop(chat_id, None)
-        if hint:
-            try:
-                hinted = int(hint)
-            except (TypeError, ValueError):
-                return None
-            if not any(mid == hinted for mid, _ in queue or ()):
-                # A concrete id that is not an @ we recorded: this turn was not
-                # triggered by a mention we know about, so do not fall back to
-                # whatever happens to be queued.
-                return None
-            while queue and queue[0][0] != hinted:
-                queue.popleft()
-            queue.popleft()
-            return hinted
-        if queue:
-            return queue.popleft()[0]
-        return None
+                return hinted
+            if queue:
+                return queue.popleft()[0]
+            return None
 
     async def _react_to_mention(self, chat_id: str, message_id: int) -> None:
         """Best-effort receipt, once per message, on the OneBot event loop."""
@@ -3813,8 +3830,9 @@ def _adapter_for_chat(chat_id: str) -> Optional[OneBotAdapter]:
             continue
         if not adapter._reaction_on_mention:
             continue
-        if adapter._pending_mentions.get(chat_id):
-            return adapter
+        with adapter._pending_mentions_lock:
+            if adapter._pending_mentions.get(chat_id):
+                return adapter
     _LIVE_ADAPTERS[:] = [r for r in _LIVE_ADAPTERS if r() is not None]
     return None
 
@@ -3856,6 +3874,8 @@ def _on_stream_start(**_kwargs) -> None:
             return
         # Core leaves HERMES_SESSION_MESSAGE_ID empty for OneBot inbound
         # messages, so the adapter's per-chat pending queue supplies the id.
+        # （基于当前核心行为的假设：OneBot 入站不写 HERMES_SESSION_MESSAGE_ID；
+        # 若核心未来改变，此处的队列回落将不再生效。）
         message_id = adapter._current_mention_id(chat_id, hint)
         if message_id is None:
             logger.debug("[onebot] mention reaction skipped: pending @ expired for %s", chat_id)

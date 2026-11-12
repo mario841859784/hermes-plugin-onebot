@@ -940,3 +940,28 @@ passed + 4 skipped**（v1.10.0 基线 200 + 净增 10，零回归；
 - 定向：`test_onebot_platform.py -q -k reaction` → **24 passed, 214 deselected**。
 - 完整：`cd tests && HERMES_AGENT_HOME=/home/ai/.hermes/hermes-agent ../.venv/bin/python -m pytest test_onebot_platform.py -q` → **237 passed, 1 skipped**（25.24s，0 failed；基线列出的两条旧 e2e 本次均通过）。
 - `git diff --check` 通过；测试临时目录、Hermes home、缓存均隔离在本仓库内，禁用外部 Python 字节码写入。
+
+## 28. @ 回执遗留收口（2026-11-12，v1.12.1，PR #3 review）
+
+PR #3 review 的三项代码遗留（第 4 项真机验证不在本次范围）：
+
+- 加锁：`_pending_mentions` 由事件循环线程写（`_remember_mention`）、worker
+  线程读写（`_current_mention_id` / `_adapter_for_chat`），新增实例级
+  `threading.Lock`（`_pending_mentions_lock`）保护对它的全部访问，
+  check-then-act 不再跨线程交错；锁粒度仅覆盖本表操作，TTL / 上限 /
+  pop 顺序不变。`_reacted_messages` 仅事件循环线程访问，不加锁并补注释。
+- 记录时机后移：`_remember_mention` 移到 `await handle_message(event)` 返回、
+  core 在 event 上标注 `_gateway_accepted=True`（接受或成功排队）之后才入队，
+  被拒收的 @ 不再滞留队列、不会被同 chat 下一条无 hint 的 turn 按队头回落
+  贴到从未被回复的旧消息上。注释如实标注残留边界：该标志是返回瞬间的判定
+  快照且依赖当前核心行为；排队事件此后再被丢弃的极端路径仍留记录，由 TTL 兜底。
+- 注释/文档统一：核实全仓已无 `_mentioned_messages` 等旧名（0 处，无需改动）；
+  `_on_stream_start` 处补「核心对 OneBot 入站不写 HERMES_SESSION_MESSAGE_ID
+  是基于当前核心行为的假设」注释。
+
+### 测试
+
+新增 3 个用例：admission 通过/拒收两分支的记录时机（拒收不入队）、多线程
+读写并发下每条 @ 恰好被消费一次（锁不变量）；既有用例的 handle_message 桩
+补 `_gateway_accepted = True` 模拟核心 admission 标注。验证记录见汇报。
+版本 1.12.0 → 1.12.1（plugin.yaml / dashboard manifest / PLUGIN_VERSION）。
