@@ -34,7 +34,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 |---|---|
 | Hermes | 网关启用 onebot 平台 |
 | OneBot 11 桥 | NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma（反向或正向 WebSocket） |
-| 消息表情回应 | 仅 NapCat（`set_msg_emoji_like`） |
+| 消息表情回应 | NapCat / SnowLuma（`set_msg_emoji_like`） |
 | 可选依赖 | Hermes 主机上装 `ffmpeg` 用于语音转写（适配器启动时探测一次，缺失即打 WARNING——装上前语音转文字不可用）；`stt:` 下配置 STT 后端（本地 faster-whisper 首次使用自动下载，或 OpenAI 兼容 API）；文字图卡片需要 CJK 字体（见下） |
 
 ## 安装（独立仓）
@@ -121,7 +121,7 @@ gateway:
 | `access_token` | 空 | OneBot token，必须与桥一致 |
 | `bot_qq` | 空 | 机器人 QQ（空 = 从 meta 事件学习） |
 | `require_mention` | `true` | 群聊：仅被 @ 或回复机器人自己时响应（无法判定被回复者时回落为响应） |
-| `reaction_on_mention` | `false` | 模型首次开始流式输出时给显式 @ 机器人的群消息贴表情；仅 NapCat |
+| `reaction_on_mention` | `false` | 模型首次开始流式输出时给显式 @ 机器人的群消息贴表情；NapCat / SnowLuma |
 | `reaction_emoji` | `178` | 回执的 QQ 表情 ID（默认「微笑」） |
 | `dm_policy` | `open` | `open`（仅管理员）/ `allowlist` / `disabled` |
 | `allow_from` | `[]` | `dm_policy=allowlist` 时的允许用户 id |

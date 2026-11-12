@@ -42,7 +42,7 @@ config_schema:
     description: "存入 .env；与桥一致，非 loopback 绑定时必填"}
   require_mention: {type: bool, default: true, label: "群聊仅 @ 时响应"}
   reaction_on_mention: {type: bool, default: false, label: "群聊 @ 表情回执",
-    description: "被 @ 的群消息在模型首次开始流式输出时贴表情（仅 NapCat）"}
+    description: "被 @ 的群消息在模型首次开始流式输出时贴表情（NapCat / SnowLuma）"}
   reaction_emoji: {type: int, default: 178, label: "回执表情 ID",
     description: "QQ 表情 ID，默认 178（微笑）"}
   dm_policy: {type: str, choices: [open, allowlist, disabled], default: open,

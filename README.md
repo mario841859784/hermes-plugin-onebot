@@ -36,7 +36,7 @@ User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
 |---|---|
 | Hermes | gateway with the onebot platform enabled |
 | OneBot 11 bridge | NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma (reverse or forward WebSocket) |
-| Message reactions | NapCat only (`set_msg_emoji_like`) |
+| Message reactions | NapCat / SnowLuma (`set_msg_emoji_like`) |
 | Optional deps | `ffmpeg` on the Hermes host for voice transcription (the adapter probes it once at startup and logs a WARNING — voice STT stays off until you install it); an STT backend configured under `stt:` (local faster-whisper, auto-downloaded on first use, or an OpenAI-compatible API); CJK fonts for text-image cards (see below) |
 
 ## Install (standalone repo)
@@ -123,7 +123,7 @@ gateway:
 | `access_token` | empty | OneBot token, must match the bridge |
 | `bot_qq` | empty | bot's QQ (empty = learned from meta events) |
 | `require_mention` | `true` | groups: only respond when @'d or replying to the bot (undeterminable replies fall back to responding) |
-| `reaction_on_mention` | `false` | react to an explicit group @ when the model first starts streaming; NapCat only |
+| `reaction_on_mention` | `false` | react to an explicit group @ when the model first starts streaming; NapCat / SnowLuma |
 | `reaction_emoji` | `178` | QQ emoji ID for the receipt (default: smile) |
 | `dm_policy` | `open` | `open` (admins only) / `allowlist` / `disabled` |
 | `allow_from` | `[]` | allowed user ids when `dm_policy=allowlist` |
