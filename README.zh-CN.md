@@ -1,6 +1,6 @@
 # QQ（OneBot）
 
-Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.github.io/)、[Lagrange](https://github.com/LagrangeDev/Lagrange.Core)、LLOneBot、go-cqhttp 和 [SnowLuma](https://snowluma.github.io/)。跟需要腾讯审核的官方 QQ Bot 平台不同，它用本地桥驱动一个普通 QQ 号，适合个人机器人和官方平台覆盖不到的群。
+Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.github.io/)、[Lagrange](https://github.com/LagrangeDev/Lagrange.Core)、LLOneBot、go-cqhttp 和 SnowLuma。跟需要腾讯审核的官方 QQ Bot 平台不同，它用本地桥驱动一个普通 QQ 号，适合个人机器人和官方平台覆盖不到的群。
 
 ```
 用户 (QQ) ←→ NapCat ←→ Hermes onebot 适配器 ←→ Hermes agent
@@ -216,7 +216,7 @@ base64 内嵌上报的大于 4 MiB 的帧会被拒收。生产传图以 URL（Na
 
 ### SnowLuma 接入
 
-[SnowLuma](https://snowluma.github.io/) 是 TS 运行时的 OneBot v11 实现，扩展 action 按 NapCat 命名兼容，适配器可直接对接。两种连接方式：
+SnowLuma 是 TS 运行时的 OneBot v11 实现，扩展 action 按 NapCat 命名兼容，适配器可直接对接。其仓库与站点目前不公开提供，请自行获取。两种连接方式：
 
 - **reverse 模式（推荐，SnowLuma 拨入）**：在 SnowLuma 的 WebUI 添加一个 **反向 WebSocket** 客户端：
   - URL：`ws://<hermes-host>:8643/ws`（SnowLuma 与 Hermes 不在同一台机器时用局域网 IP，别用 `127.0.0.1`）

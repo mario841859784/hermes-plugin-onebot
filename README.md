@@ -2,7 +2,7 @@
 
 > 中文版见 [`README.zh-CN.md`](README.zh-CN.md) · Chinese readme: [`README.zh-CN.md`](README.zh-CN.md)
 
-The OneBot adapter connects Hermes to QQ through the **OneBot 11 protocol**, compatible with [NapCat](https://napneko.github.io/), [Lagrange](https://github.com/LagrangeDev/Lagrange.Core), LLOneBot, go-cqhttp, and [SnowLuma](https://snowluma.github.io/). Instead of the official QQ Bot platform (which requires a Tencent-approved app), it drives a regular QQ account through a local bridge. Good for personal bots and groups the official platform can't reach.
+The OneBot adapter connects Hermes to QQ through the **OneBot 11 protocol**, compatible with [NapCat](https://napneko.github.io/), [Lagrange](https://github.com/LagrangeDev/Lagrange.Core), LLOneBot, go-cqhttp, and SnowLuma. Instead of the official QQ Bot platform (which requires a Tencent-approved app), it drives a regular QQ account through a local bridge. Good for personal bots and groups the official platform can't reach.
 
 ```
 User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
@@ -229,7 +229,7 @@ The bridge must be on a network Hermes can reach (same LAN / routable); WS conne
 
 ### SnowLuma-side setup
 
-[SnowLuma](https://snowluma.github.io/) is a TypeScript-runtime OneBot v11 implementation whose extension actions follow NapCat naming, so the adapter works with it directly. Connect it one of two ways:
+SnowLuma is a TypeScript-runtime OneBot v11 implementation whose extension actions follow NapCat naming, so the adapter works with it directly. Its repository and site are not publicly available at the moment; obtain it on your own. Connect it one of two ways:
 
 - **reverse mode (recommended, SnowLuma dials in)**: in SnowLuma's WebUI add a **反向 WebSocket** client:
   - URL: `ws://<hermes-host>:8643/ws` (use the LAN IP, not `127.0.0.1`, when SnowLuma and Hermes are on different machines)
